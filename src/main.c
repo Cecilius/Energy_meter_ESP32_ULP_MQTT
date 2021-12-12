@@ -1,6 +1,7 @@
 // main.c
 
 #include <string.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -9,19 +10,27 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_sleep.h"
 #include "esp_rom_crc.h"
 #include <driver/adc.h>
 #include "driver/rtc_io.h"
+#include "driver/gpio.h"
+#include "esp32/ulp.h"
+#include "soc/rtc_cntl_reg.h"
+#include "soc/sens_reg.h"
+#include "soc/rtc_periph.h"
+#include "esp_sntp.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
-static const char *TAG = "wifi + ds18b20";
+#include "ulp_main.h"
+
+static const char *TAG = "Enemon";
 #include "secrets.h"
 #include "ha_config.h"
 #include "MQTT.h"
-#include "measure.h"
 
 // How many times will try to connect WiFi
 #define CONECTION_RETRY 2
@@ -38,8 +47,128 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_FAIL_BIT BIT1
 
 static int s_retry_num = 0;
+uint32_t pulse_count = 0;
+uint32_t previous_pulse_count = 0;
+uint32_t time_difference_ms = 0;
+esp_reset_reason_t cause;
 
-void enter_deep_sleep();
+float battery;
+
+extern const uint8_t ulp_main_bin_start[] asm("_binary_ulp_main_bin_start");
+extern const uint8_t ulp_main_bin_end[] asm("_binary_ulp_main_bin_end");
+
+static void init();
+
+static void init_ulp_program(void);
+
+static void update_pulse_count(void);
+
+static void battery_measurement();
+
+static void event_handler(void *arg, esp_event_base_t event_base,
+                          int32_t event_id, void *event_data);
+
+void wifi_init_sta(void);
+
+static void enter_deep_sleep();
+
+
+void app_main(void)
+{
+    init();
+
+    // Turn on WiFi
+    wifi_init_sta();
+
+    start_MQTT();
+
+    // Send MQTT
+    uint32_t power_consumption = 0;
+    if(time_difference_ms != 0) power_consumption = (( pulse_count - previous_pulse_count ) * 360000) / time_difference_ms; 
+    uint32_t daily_energy = pulse_count / 10;
+    uint32_t total_energy = pulse_count / 10;
+
+    char message[12];
+    char topic[70];
+    char dev_topic[30];
+    sprintf(dev_topic, "%s/%s", HA_UNIQ_ID, HA_COMPONENT);
+    sprintf(message, "%.2f", battery);
+    sprintf(topic, "%s/battery/state", dev_topic);
+    send_MQTT(topic, message);
+    sprintf(message, "%d", power_consumption);
+    sprintf(topic, "%s/power_consumption/state", dev_topic);
+    send_MQTT(topic, message);
+    sprintf(message, "%d", daily_energy);
+    sprintf(topic, "%s/daily_energy/state", dev_topic);
+    send_MQTT(topic, message);
+    sprintf(message, "%d", total_energy);
+    sprintf(topic, "%s/total_energy/state", dev_topic);
+    send_MQTT(topic, message);
+    if (cause != ESP_RST_DEEPSLEEP)
+    {
+        char conf_topic[100];
+        char device_topic[70];
+        char conf_message[400];
+        sprintf(device_topic, "homeassistant/%s/%s", HA_COMPONENT, HA_UNIQ_ID);
+        sprintf(conf_topic, "%s/power_consumption/config", device_topic);
+        sprintf(conf_message, "{\"dev_cla\":\"power\",\"unit_of_meas\":\"W\",\"stat_cla\":\"measurement\",\"name\":\"Power consumption\",\"stat_t\":\"%s/%s/power_consumption/state\",\"uniq_id\":\"%s-power\",\"dev\":{\"ids\":\"%s\",\"name\":\"%s\",\"sw\":\"%s\"}}", HA_UNIQ_ID, HA_COMPONENT, HA_UNIQ_ID, HA_DEV_ID, HA_DEV_NAME, HA_DEV_SW);
+        send_MQTT(conf_topic, conf_message);
+        sprintf(conf_topic, "%s/daily_energy/config", device_topic);
+        sprintf(conf_message, "{\"dev_cla\":\"energy\",\"unit_of_meas\":\"Wh\",\"stat_cla\":\"total\",\"name\":\"Daily energy\",\"stat_t\":\"%s/%s/daily_energy/state\",\"uniq_id\":\"%s-denergy\",\"dev\":{\"ids\":\"%s\",\"name\":\"%s\",\"sw\":\"%s\"}}", HA_UNIQ_ID, HA_COMPONENT, HA_UNIQ_ID, HA_DEV_ID, HA_DEV_NAME, HA_DEV_SW);
+        send_MQTT(conf_topic, conf_message);
+        sprintf(conf_topic, "%s/total_energy/config", device_topic);
+        sprintf(conf_message, "{\"dev_cla\":\"energy\",\"unit_of_meas\":\"Wh\",\"stat_cla\":\"total\",\"name\":\"Total Energy\",\"stat_t\":\"%s/%s/total_energy/state\",\"uniq_id\":\"%s-tenergy\",\"dev\":{\"ids\":\"%s\",\"name\":\"%s\",\"sw\":\"%s\"}}", HA_UNIQ_ID, HA_COMPONENT, HA_UNIQ_ID, HA_DEV_ID, HA_DEV_NAME, HA_DEV_SW);
+        send_MQTT(conf_topic, conf_message);
+        sprintf(conf_topic, "%s/battery/config", device_topic);
+        sprintf(conf_message, "{\"dev_cla\":\"voltage\",\"unit_of_meas\":\"V\",\"stat_cla\":\"measurement\",\"name\":\"Battery level\",\"stat_t\":\"%s/%s/battery/state\",\"uniq_id\":\"%s-battery\",\"dev\":{\"ids\":\"%s\",\"name\":\"%s\",\"sw\":\"%s\"}}", HA_UNIQ_ID, HA_COMPONENT, HA_UNIQ_ID, HA_DEV_ID, HA_DEV_NAME, HA_DEV_SW);
+        send_MQTT(conf_topic, conf_message);
+    }
+
+    end_MQTT();
+
+    enter_deep_sleep();
+}
+
+void init()
+{
+    cause = esp_reset_reason();
+    if (cause != ESP_RST_DEEPSLEEP)
+    {
+        printf("Not ULP wakeup, initializing ULP\n");
+        init_ulp_program();
+    }
+    else
+    {
+        printf("ULP wakeup, saving pulse count\n");
+        update_pulse_count();
+    }
+
+    gettimeofday(&app_start, NULL);
+    ESP_LOGI(TAG, "%d.%06d started at %ld.%06ld\n", 0, 0, app_start.tv_sec, app_start.tv_usec);
+
+    battery_measurement();
+
+    //Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+}
+
+void battery_measurement()
+{
+    //configure ADC and get reading from battery
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC1_CHANNEL_5, ADC_ATTEN_DB_0);
+    // Reading divided by full range times referent voltage * voltage divider
+    int raw_adc = adc1_get_raw(ADC1_CHANNEL_5);
+    ESP_LOGD(TAG, "Raw ADC = %d\n", raw_adc);
+    battery = (float)raw_adc / 4096 * 1.1 / 100 * (100 + 330);
+}
 
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
@@ -76,7 +205,8 @@ void wifi_init_sta(void)
     s_wifi_event_group = xEventGroupCreate();
 
     // WiFi Persistent
-    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if(cause != ESP_RST_DEEPSLEEP)
+        esp_wifi_set_storage(WIFI_STORAGE_RAM);
 
     ESP_ERROR_CHECK(esp_netif_init());
 
@@ -112,8 +242,8 @@ void wifi_init_sta(void)
             .ssid = MY_SECRET_SSID,
             .password = MY_SECRET_PASS,
             /* Setting a password implies station will connect to all security modes including WEP/WPA.
-            * However these modes are deprecated and not advisable to be used. Incase your Access point
-            * doesn't support WPA2, these mode can be enabled by commenting below line */
+             * However these modes are deprecated and not advisable to be used. Incase your Access point
+             * doesn't support WPA2, these mode can be enabled by commenting below line */
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
             .pmf_cfg = {
                 .capable = true,
@@ -159,78 +289,101 @@ void wifi_init_sta(void)
     vEventGroupDelete(s_wifi_event_group);
 }
 
-void app_main(void)
+static void init_ulp_program(void)
 {
-    gettimeofday(&app_start, NULL);
-    ESP_LOGW(TAG, "%d.%06d started at %ld.%06ld\n", 0, 0, app_start.tv_sec, app_start.tv_usec);
+    esp_err_t err = ulp_load_binary(0, ulp_main_bin_start,
+                                    (ulp_main_bin_end - ulp_main_bin_start) / sizeof(uint32_t));
+    ESP_ERROR_CHECK(err);
 
-    // Create task to measure
-    xTaskCreate(vTaskMeasure, "DS18B20", 1024 * 4, NULL, 3, NULL);
+    /* To speed-up the program you can use just RTC-GPIO 0-15 */
+    /* GPIO used for pulse counting. */
+    gpio_num_t gpio_num = GPIO_NUM_15;
+    int rtcio_num = rtc_io_number_get(gpio_num);
+    assert(rtc_gpio_is_valid_gpio(gpio_num) && "GPIO used for pulse counting must be an RTC IO");
+    /* GPIO RED LED. */
+    gpio_num_t gpio_num_rl = GPIO_NUM_2;
+    int rtcio_num_rl = rtc_io_number_get(gpio_num_rl);
+    assert(rtc_gpio_is_valid_gpio(gpio_num_rl) && "GPIO used for pulse counting must be an RTC IO");
+    /* GPIO GREEN LED. */
+    gpio_num_t gpio_num_gl = GPIO_NUM_4;
+    int rtcio_num_gl = rtc_io_number_get(gpio_num_gl);
+    assert(rtc_gpio_is_valid_gpio(gpio_num_gl) && "GPIO used for pulse counting must be an RTC IO");
 
-    const int wakeup_time_sec = 300;
-    ESP_LOGI(TAG, "Enabling timer wakeup, %ds\n", wakeup_time_sec);
-    esp_sleep_enable_timer_wakeup(wakeup_time_sec * 1000000);
+    /* Initialize some variables used by ULP program.
+     * Each 'ulp_xyz' variable corresponds to 'xyz' variable in the ULP program.
+     * These variables are declared in an auto generated header file,
+     * 'ulp_main.h', name of this file is defined in component.mk as ULP_APP_NAME.
+     * These variables are located in RTC_SLOW_MEM and can be accessed both by the
+     * ULP and the main CPUs.
+     *
+     * Note that the ULP reads only the lower 16 bits of these variables.
+     */
+    ulp_next_edge = 1;
+    ulp_previous_count_l = 0;
+    ulp_previous_count_h = 0;
+    ulp_signal_count_l = 0;
+    ulp_signal_count_h = 0;
+    ulp_io_number = rtcio_num; /* map from GPIO# to RTC_IO# */
+    ulp_io_number_rl = rtcio_num_rl; /* map from GPIO# to RTC_IO# */
+    ulp_io_number_gl = rtcio_num_gl; /* map from GPIO# to RTC_IO# */
 
-    //configure ADC and get reading from battery
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_0);
-    // Reading divided by full range times referent voltage * voltage divider
-    int raw_adc = adc1_get_raw(ADC1_CHANNEL_0);
-    ESP_LOGD(TAG, "Raw ADC = %d\n", raw_adc);
-    float battery = (float)raw_adc / 4096 * 1.1 / 22 * (22 + 68);
+    /* Initialize selected GPIO as RTC IO, enable input, disable pullup and pulldown */
+    rtc_gpio_init(gpio_num);
+    rtc_gpio_set_direction(gpio_num, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pulldown_en(gpio_num);
+    rtc_gpio_pullup_dis(gpio_num);
+    rtc_gpio_hold_en(gpio_num);
 
-    //Initialize NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
+    rtc_gpio_init(gpio_num_rl);
+    rtc_gpio_set_direction(gpio_num_rl, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_pulldown_dis(gpio_num_rl);
+    rtc_gpio_pullup_dis(gpio_num_rl);
+    rtc_gpio_hold_en(gpio_num_rl);
 
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+    rtc_gpio_init(gpio_num_gl);
+    rtc_gpio_set_direction(gpio_num_gl, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_pulldown_dis(gpio_num_gl);
+    rtc_gpio_pullup_dis(gpio_num_gl);
+    rtc_gpio_hold_en(gpio_num_gl);
 
-    // Turn on WiFi
-    wifi_init_sta();
+    struct timeval tv_now;
+    gettimeofday(&tv_now, NULL);
+    int64_t time_us = (int64_t)tv_now.tv_sec * 1000000L + (int64_t)tv_now.tv_usec;
+    ulp_time1 = time_us % 65536;
+    ulp_time2 = (int64_t)( time_us / 65536 ) % 65536;
+    ulp_time3 = (int64_t)( time_us / 4294967296 ) % 65536;
+    ulp_time4 = (int64_t)( time_us / ( 4294967296 * 65536 ) );
 
-    start_MQTT();
-
-    //Send MQTT
-    char message[7];
-    char topic[50];
-    sprintf(message, "%.2f", battery);
-    sprintf(topic, "%s/%s/battery/state", HA_UNIQ_ID, HA_COMPONENT);
-    send_MQTT(topic, message);
-    sprintf(message, "%.1f", temperature);
-    sprintf(topic, "%s/%s/%s/state", HA_UNIQ_ID, HA_COMPONENT, HA_SENSOR);
-    if (esp_reset_reason() != ESP_RST_DEEPSLEEP)
-    {
-        char conf_topic[80];
-        char conf_message[400];
-        sprintf(conf_topic, "homeassistant/%s/%s/%s/config", HA_COMPONENT, HA_UNIQ_ID, HA_SENSOR);
-        sprintf(conf_message, "{\"dev_cla\":\"%s\",\"unit_of_meas\":\"%s\",\"stat_cla\":\"%s\",\"name\":\"%s\",\"stat_t\":\"%s\",\"uniq_id\":\"%s-%s\",\"dev\":{\"ids\":\"%s\",\"name\":\"%s\",\"sw\":\"%s\"}}", HA_SENSOR, HA_UNIT_OF_MEAS, HA_STAT_CLA, HA_NAME, topic, HA_UNIQ_ID, HA_SENSOR, HA_DEV_ID, HA_DEV_NAME, HA_DEV_SW);
-        send_MQTT(conf_topic, conf_message);
-        sprintf(conf_topic, "homeassistant/%s/%s/battery/config", HA_COMPONENT, HA_UNIQ_ID);
-        sprintf(conf_message, "{\"dev_cla\":\"voltage\",\"unit_of_meas\":\"V\",\"stat_cla\":\"measurement\",\"name\":\"Battery level\",\"stat_t\":\"%s/%s/battery/state\",\"uniq_id\":\"%s-battery\",\"dev\":{\"ids\":\"%s\",\"name\":\"%s\",\"sw\":\"%s\"}}", HA_UNIQ_ID, HA_COMPONENT, HA_UNIQ_ID, HA_DEV_ID, HA_DEV_NAME, HA_DEV_SW);
-        send_MQTT(conf_topic, conf_message);
-    }
-
-    // wait till we have result of measurement (In case it'll be too slow)
-    int wait = 0;
-    while (!ready_flag && wait < 20)
-    {
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-        wait++;
-    }
-
-    send_MQTT(topic, message);
-
-    end_MQTT();
-
-    enter_deep_sleep();
+    /* Start the program */
+    err = ulp_run(&ulp_entry - RTC_SLOW_MEM);
+    ESP_ERROR_CHECK(err);
 }
 
-void enter_deep_sleep()
+static void update_pulse_count(void)
+{
+    /* ULP program counts signal edges, convert that to the number of pulses */
+    previous_pulse_count = (ulp_previous_count_l & UINT16_MAX) + (ulp_previous_count_h & UINT16_MAX) * 65536;
+    pulse_count = (ulp_signal_count_l & UINT16_MAX) + (ulp_signal_count_h & UINT16_MAX) * 65536;
+    /* get actual time */
+    struct timeval tv_now;
+    gettimeofday(&tv_now, NULL);
+    int64_t time_us = (int64_t)tv_now.tv_sec * 1000000L + (int64_t)tv_now.tv_usec;
+    int64_t time_old = (ulp_time1 & UINT16_MAX) + (ulp_time2 & UINT16_MAX) * 65536 + (ulp_time3 & UINT16_MAX) * 4294967296 + (ulp_time4 & UINT16_MAX) * 4294967296 * 65536;
+    time_difference_ms = ( time_us - time_old ) / 1000;
+    ulp_time1 = time_us % 65536;
+    ulp_time2 = (int64_t)( time_us / 65536 ) % 65536;
+    ulp_time3 = (int64_t)( time_us / 4294967296 ) % 65536;
+    ulp_time4 = (int64_t)( time_us / ( 4294967296 * 65536 ) );
+
+    printf("Previous pulse count from ULP: %5d\n", previous_pulse_count);
+    printf("Pulse count from ULP: %5d\n", pulse_count);
+    printf("Time difference: %.3f\n", (float)(time_difference_ms) / 1000);
+    /* Save current pulse count as previous to ULP */
+    ulp_previous_count_l = pulse_count % 65536;
+    ulp_previous_count_h = pulse_count / 65536;
+}
+
+static void enter_deep_sleep()
 {
     ESP_LOGW(TAG, "Turning off WiFi\n");
 
@@ -247,15 +400,21 @@ void enter_deep_sleep()
         --tv.tv_sec;
     }
 
+    const int wakeup_time_sec = 58;
+    ESP_LOGI(TAG, "Enabling timer wakeup, %ds\n", wakeup_time_sec);
+    esp_sleep_enable_timer_wakeup((wakeup_time_sec) * 1000000);
+
     ESP_LOGW(TAG, "Entering deep sleep after %ld.%06ld seconds\n\n", tv.tv_sec, tv.tv_usec);
     // Allow prints to finish
     fflush(stdout);
 
-    // Isolate GPIO2 (RTC GPIO 12) to reduce power consumption during deep sleep - external pullup.
+    /* Disconnect GPIO12 and GPIO15 to remove current drain through
+     * pullup/pulldown resistors.
+     * GPIO12 may be pulled high to select flash voltage.
+     */
     rtc_gpio_isolate(GPIO_NUM_12);
-
-    // Disable ROM logging (should disable UART)
-    esp_deep_sleep_disable_rom_logging();
+//    rtc_gpio_isolate(GPIO_NUM_15);
+    esp_deep_sleep_disable_rom_logging(); // suppress boot messages
 
     esp_deep_sleep_start();
 }
